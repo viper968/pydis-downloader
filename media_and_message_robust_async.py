@@ -683,7 +683,7 @@ async def download_attachment(attachment, media_dir, message_id, counter, total_
         return
 
     await wait_for_wifi_connection()
-    await check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
+    #await check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
     #await pause_during_time_range("07:00", "11:00")
 
     # Acquire semaphore (limits how many streaming downloads run concurrently)
@@ -825,7 +825,7 @@ async def download_embed(embed_url, file_path, current_time, message_timestamp, 
     temp_path = file_path + ".part"
 
     await wait_for_wifi_connection()
-    await check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
+    #await check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
     #await pause_during_time_range("07:00", "11:00")
 
     async with DOWNLOAD_SEMAPHORE:
