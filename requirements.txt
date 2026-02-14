@@ -1,0 +1,7 @@
+# will have to test this later to see if this is everything required, if the script complains its missing something please write an issue with the error
+aiohttp
+aiolimiter
+discord.py
+requests
+tqdm
+urllib3
