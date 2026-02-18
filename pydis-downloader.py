@@ -1,4 +1,3 @@
-#!/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2/python_libs/discord/bin/python
 import os
 import requests
 import argparse
@@ -19,9 +18,6 @@ from urllib.parse import urlparse, urlunparse, parse_qsl
 import math
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import asyncio
-import aiohttp
-import aiolimiter
 
 def log_debug_point(label, url=None):
     """Write a timestamped debug message to tqdm for live tracing."""
@@ -38,11 +34,20 @@ DOWNLOAD_READ_TIMEOUT = 20           # seconds (per-socket-read)
 DOWNLOAD_STALL_TIMEOUT = 45          # seconds without progress -> consider stalled
 DOWNLOAD_CHUNK_SIZE = 8192
 
-# Global rate limiter for Discord API (approx 50 req/sec)
-API_LIMITER = aiolimiter.AsyncLimiter(50, 1)
-
 # Shared semaphore to limit concurrent streaming downloads (prevents resource exhaustion)
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(DOWNLOAD_MAX_CONCURRENT)
+DOWNLOAD_SEMAPHORE = threading.Semaphore(DOWNLOAD_MAX_CONCURRENT)
+
+# Shared requests.Session with a simple adapter for connection pooling
+def _make_download_session():
+    s = requests.Session()
+    # keep pool reasonably sized; we won't rely on Retry here because we handle retries manually
+    adapter = requests.adapters.HTTPAdapter(pool_maxsize=20, max_retries=0)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+# One session instance reused by download functions
+_DOWNLOAD_SESSION = _make_download_session()
 # ------------------------------------------------------------------------------------
 
 class DownloadManager:
@@ -187,7 +192,7 @@ class DownloadManager:
 def rate_limiter(max_calls, per_seconds):
     """
     Decorator to limit how many times a function can be started
-    within a given time window, across coroutines.
+    within a given time window, across threads.
     If a skip predicate is attached to the wrapper (via wrapper.set_skip_pred),
     the predicate is invoked before any rate-limiter waiting. If the predicate
     returns True, the wrapped function is called immediately (no rate-limit wait).
@@ -197,14 +202,14 @@ def rate_limiter(max_calls, per_seconds):
 
     def decorator(func):
         @wraps(func)
-        async def wrapper(*args, **kwargs):
+        def wrapper(*args, **kwargs):
             # Check for an attached skip predicate (fast-path)
             skip_pred = getattr(wrapper, "_skip_pred", None)
             if callable(skip_pred):
                 try:
                     if skip_pred(*args, **kwargs):
                         # skip the rate-limit and run immediately
-                        return await func(*args, **kwargs)
+                        return func(*args, **kwargs)
                 except Exception:
                     # If predicate errors, fall through to normal rate-limiting behavior
                     pass
@@ -227,10 +232,10 @@ def rate_limiter(max_calls, per_seconds):
 
                 # sleep outside the lock
                 if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
+                    time.sleep(sleep_time)
 
             # actually run the function
-            return await func(*args, **kwargs)
+            return func(*args, **kwargs)
 
         # Small helper to allow setting a skip predicate later:
         def set_skip_pred(predicate):
@@ -257,12 +262,12 @@ def _load_link_index(path):
         pass
     return s
 
-# in-memory set + lock (module-level, shared by tasks)
+# in-memory set + lock (module-level, shared by threads)
 _LINK_INDEX_LOCK = threading.Lock()
 _LINK_INDEX_SET = _load_link_index(DOWNLOAD_LINKS_FILE)
 
 def _record_link(url):
-    """Append url to persistent index (task-safe) and update in-memory set."""
+    """Append url to persistent index (thread-safe) and update in-memory set."""
     with _LINK_INDEX_LOCK:
         if url in _LINK_INDEX_SET:
             return
@@ -299,7 +304,7 @@ def _normalize_url(url, drop_query_params=None):
 # --- END INSERT ---
 
 # Helper stuff
-async def wait_for_wifi_connection(check_interval=600):
+def wait_for_wifi_connection(check_interval=600):
 	"""
 	Check if the device is connected to the internet via Wi-Fi.
 	If not connected, wait for a specified interval before retrying.
@@ -307,21 +312,20 @@ async def wait_for_wifi_connection(check_interval=600):
 	Args:
 	- check_interval: Time in seconds between connection checks (default: 3600 seconds = 1 hour).
 	"""
-	loop = asyncio.get_event_loop()
 	while True:
 		try:
 			# Attempt to connect to a reliable host (Google DNS server)
-			await loop.run_in_executor(None, socket.create_connection, ("8.8.8.8", 53), 5)
+			socket.create_connection(("8.8.8.8", 53), timeout=5)
 			# tqdm.write("f\nWi-Fi connection detected. Continuing execution.")
 			break  # Exit loop if connection is successful
 		except (socket.timeout, OSError):
 			tqdm.write(f"\nNo Wi-Fi connection detected. Retrying in {check_interval // 60} minutes...")
-			await asyncio.sleep(check_interval)
+			time.sleep(check_interval)
 
 # Example usage: Call this function anywhere to pause execution until Wi-Fi is connected
 # wait_for_wifi_connection()
 
-async def check_storage(drive_path: str, threshold_gb: float):
+def check_storage(drive_path: str, threshold_gb: float):
     """
     Checks the available storage space on the specified drive.
     If the free space is less than the given threshold (in GB), it waits 60 minutes and checks again.
@@ -338,7 +342,7 @@ async def check_storage(drive_path: str, threshold_gb: float):
 
         if free_space_gb < threshold_gb:
             tqdm.write(f"Warning: Free space below {threshold_gb} GB! Checking again in 10 minutes...")
-            await asyncio.sleep(600)  # Wait 10 minutes
+            time.sleep(600)  # Wait 10 minutes
         else:
             #tqdm.write("Sufficient storage available. Exiting check.")
             break
@@ -346,7 +350,7 @@ async def check_storage(drive_path: str, threshold_gb: float):
 # Example usage:
 # check_storage('/mnt/external_drive', 10)  # Adjust path and threshold as needed
 
-async def pause_during_time_range(start_time_str: str, end_time_str: str, check_interval: int = 3600):
+def pause_during_time_range(start_time_str: str, end_time_str: str, check_interval: int = 3600):
     """
     Pauses code execution if the current time is between start_time and end_time.
 
@@ -364,7 +368,7 @@ async def pause_during_time_range(start_time_str: str, end_time_str: str, check_
         # Check if now is between start and end (handles overnight spans)
         if (start < end and start <= now < end) or (start > end and (now >= start or now < end)):
             tqdm.write(f"Current time {now.strftime('%H:%M:%S')} is within the pause range. Sleeping for {check_interval/60/60} hour(s)...")
-            await asyncio.sleep(check_interval)
+            time.sleep(check_interval)
         else:
             #tqdm.write(f"Current time {now.strftime('%H:%M:%S')} is outside the pause range. Continuing execution.")
             break
@@ -423,7 +427,7 @@ def sanitize_path(path, existing_names):
 
 #============================================================================================ Helper functions (APIs and file loading/checking)
 
-async def api_request(url, headers, params=None):
+def api_request(url, headers, params=None):
     """
     Make an API request with special handling:
       - 429: Wait for the 'Retry-After' delay then retry.
@@ -432,25 +436,24 @@ async def api_request(url, headers, params=None):
       - 200: Return JSON.
       - Other errors: Wait briefly and retry.
     """
-    await wait_for_wifi_connection()
+    wait_for_wifi_connection()
 
-    async with API_LIMITER:
-        while True:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params) as response:
-                    if response.status == 429:
-                        retry_after = int(response.headers.get("Retry-After", 1))
-                        tqdm.write(f"Rate limited. Retrying in {retry_after} seconds...")
-                        await asyncio.sleep(retry_after)
-                    elif response.status == 403:
-                        raise Exception("Received 403 Unauthorized response; stopping retries.")
-                    elif response.status == 200:
-                        return await response.json()
-                    elif response.status == 404:
-                        raise Exception("Received 404 Not found response; please check wifi connection")
-                    else:
-                        tqdm.write(f"Error {response.status} received; retrying in 1 second...")
-                        await asyncio.sleep(1)
+    while True:
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 1))
+            tqdm.write(f"Rate limited. Retrying in {retry_after} seconds...")
+            time.sleep(retry_after)
+        elif response.status_code == 403:
+            raise Exception("Received 403 Unauthorized response; stopping retries.")
+        elif response.status_code == 200:
+            # tqdm.write(response.json())
+            return response.json()
+        elif response.status_code == 404:
+            raise Exception("Received 404 Not found response; please check wifi connection")
+        else:
+            tqdm.write(f"Error {response.status_code} received; retrying in 1 second...")
+            time.sleep(1)
 
 def ensure_dir(path):
 	"""Ensure directory exists."""
@@ -550,11 +553,10 @@ def get_dm_folder_name(channel_metadata, output_dir):
 
 #============================================================================================ Core functions (Downloading messages, media, embeds)
 
-async def fetch_channel_name(token, channel_id, server_dir, output_dir):
+def fetch_channel_name(token, channel_id, server_dir, output_dir):
     headers = {"Authorization": token}
     url = f"https://discord.com/api/v9/channels/{channel_id}"
-    channel_data = await api_request(url, headers)
-    channel_name = channel_data.get("name", f"channel_{channel_id}")
+    channel_name = api_request(url, headers).get("name", f"channel_{channel_id}")
 
     sanitized = sanitize_filename(channel_name)
 
@@ -575,11 +577,10 @@ async def fetch_channel_name(token, channel_id, server_dir, output_dir):
 
     return sanitized
 
-async def fetch_server_name(token, guild_id, output_dir):
+def fetch_server_name(token, guild_id, output_dir):
     headers = {"Authorization": token}
     url = f"https://discord.com/api/v9/guilds/{guild_id}"
-    server_data = await api_request(url, headers)
-    server_name = server_data.get("name", f"server_{guild_id}")
+    server_name = api_request(url, headers).get("name", f"server_{guild_id}")
 
     sanitized = sanitize_filename(server_name)
 
@@ -600,8 +601,8 @@ async def fetch_server_name(token, guild_id, output_dir):
 
     return sanitized
 
-async def fetch_messages(token, channel_id, channel_dir, save_raw=False):
-	"""Fetch messages and optionally save raw data. Yields batches for streaming."""
+def fetch_messages(token, channel_id, channel_dir, save_raw=False):
+	"""Fetch messages and optionally save raw data."""
 	headers = {"Authorization": token}
 	url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
 	params = {"limit": 100}
@@ -613,42 +614,45 @@ async def fetch_messages(token, channel_id, channel_dir, save_raw=False):
 	messages_file = os.path.join(channel_dir, "messages.txt")
 	existing_timestamps = {line.split(" - ", 1)[0] for line in open(messages_file, "r", encoding="utf-8")} if os.path.exists(messages_file) else set()
 
+	new_messages = []
 	message_count = 0
 	last_timestamp = None
 
 	while True:
-		messages = await api_request(url, headers, params)
+		messages = api_request(url, headers, params)
 		if not messages:
 			break
 
 		new_batch = [msg for msg in messages if msg["id"] not in existing_ids and msg["timestamp"] not in existing_timestamps]
+		new_messages.extend(new_batch)
 		existing_ids.update(msg["id"] for msg in new_batch)
 		existing_timestamps.update(msg["timestamp"] for msg in new_batch)
 
 		if new_batch:
 			last_timestamp = new_batch[-1]["timestamp"]
-			message_count += len(new_batch)
-
-			# Save raw data batch
-			if save_raw:
-				raw_data.extend(new_batch)
-				save_json(raw_file, raw_data)
-
-			# Save formatted messages batch
-			with open(messages_file, "a", encoding="utf-8") as f:
-				for msg in reversed(new_batch):
-					f.write(f"{msg['timestamp']} - {msg['author']['username']} (aka: {msg['author'].get('global_name', 'Unknown')}): {msg.get('content', '')}\n")
-
-			tqdm.write(f"Downloaded {message_count} messages so far. Last timestamp: {last_timestamp}")
-			yield new_batch
 
 		params["before"] = messages[-1]["id"]
+		message_count += len(new_batch)
 
 		if not new_batch:
 			break
 
+		tqdm.write(f"Downloaded {message_count} messages so far. Last timestamp: {last_timestamp}")
+
+	# Save new raw data
+	if save_raw and new_messages:
+		save_json(raw_file, raw_data + new_messages)
+
+	# Save formatted messages
+	if new_messages:
+		with open(messages_file, "a", encoding="utf-8") as f:
+			for msg in reversed(new_messages):
+				f.write(f"{msg['timestamp']} - {msg['author']['username']} (aka: {msg['author'].get('global_name', 'Unknown')}): {msg.get('content', '')}\n")
+
+	return raw_data + new_messages if save_raw else new_messages
+
 @rate_limiter(max_calls=20, per_seconds=1)
-async def download_attachment(attachment, media_dir, message_id, counter, total_attachments, lock):
+def download_attachment(attachment, media_dir, message_id, counter, total_attachments, lock):
     """
     Robust download: streaming with timeouts, stall detection, retries, .part temp file,
     atomic rename to final path, and blacklist/index handling. Keeps the same external interface.
@@ -674,66 +678,65 @@ async def download_attachment(attachment, media_dir, message_id, counter, total_
 
     # If final file already exists (race-safe check)
     if os.path.exists(file_path):
-        async with lock:
+        with lock:
             counter[0] += 1
             remaining = total_attachments - counter[0]
             tqdm.write(f"Skipping already downloaded file (exists): {filename} | Remaining: {remaining}")
         # record normalized link for completeness
-        await _record_link(_check_url)
+        _record_link(_check_url)
         return
 
-    await wait_for_wifi_connection()
-    #await check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
-    #await pause_during_time_range("07:00", "11:00")
+    wait_for_wifi_connection()
+    check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
+    #pause_during_time_range("07:00", "11:00")
 
     # Acquire semaphore (limits how many streaming downloads run concurrently)
-    async with DOWNLOAD_SEMAPHORE:
+    with DOWNLOAD_SEMAPHORE:
+        session = _DOWNLOAD_SESSION
         attempt = 0
         last_err = None
         while attempt < DOWNLOAD_MAX_RETRIES:
             attempt += 1
             try:
-                async with aiohttp.ClientSession() as session:
-                    timeout = aiohttp.ClientTimeout(connect=DOWNLOAD_CONNECT_TIMEOUT, sock_read=DOWNLOAD_READ_TIMEOUT)
-                    async with session.get(url, timeout=timeout) as r:
-                        r.raise_for_status()
-                        total_size = int(r.headers.get("Content-Length", 0) or 0)
+                with session.get(url, stream=True, timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get("Content-Length", 0) or 0)
 
-                        # Ensure directory exists
-                        ensure_dir(media_dir)
+                    # Ensure directory exists
+                    ensure_dir(media_dir)
 
-                        bytes_written = 0
-                        last_progress = time.time()
+                    bytes_written = 0
+                    last_progress = time.time()
 
-                        # Ensure partial file removed from previous aborted attempt
-                        if os.path.exists(temp_path):
-                            try:
-                                os.remove(temp_path)
-                            except Exception:
-                                pass
+                    # Ensure partial file removed from previous aborted attempt
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
 
-                        # Write streaming to .part file and show per-file tqdm
-                        with open(temp_path, "wb") as fh, tqdm(
-                            total=total_size if total_size > 0 else None,
-                            unit="B",
-                            unit_scale=True,
-                            unit_divisor=1024,
-                            desc=filename[:20],
-                            leave=False
-                        ) as pbar:
-                            async for chunk in r.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
-                                if chunk:
-                                    fh.write(chunk)
-                                    bytes_written += len(chunk)
-                                    last_progress = time.time()
-                                    pbar.update(len(chunk))
+                    # Write streaming to .part file and show per-file tqdm
+                    with open(temp_path, "wb") as fh, tqdm(
+                        total=total_size if total_size > 0 else None,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=filename[:20],
+                        leave=False
+                    ) as pbar:
+                        for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                            if chunk:
+                                fh.write(chunk)
+                                bytes_written += len(chunk)
+                                last_progress = time.time()
+                                pbar.update(len(chunk))
 
-                                # Stall detection: no progress for a while
-                                if time.time() - last_progress > DOWNLOAD_STALL_TIMEOUT:
-                                    raise IOError(f"Stalled for >{DOWNLOAD_STALL_TIMEOUT}s")
+                            # Stall detection: no progress for a while
+                            if time.time() - last_progress > DOWNLOAD_STALL_TIMEOUT:
+                                raise IOError(f"Stalled for >{DOWNLOAD_STALL_TIMEOUT}s")
 
-                        # Move .part -> final atomically
-                        os.replace(temp_path, file_path)
+                    # Move .part -> final atomically
+                    os.replace(temp_path, file_path)
 
                     # Record link and update counters
                     _record_link(_check_url)
@@ -743,7 +746,7 @@ async def download_attachment(attachment, media_dir, message_id, counter, total_
                         tqdm.write(f" Remaining: {remaining} | [Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] | Successfully downloaded attachment: {file_path}")
                     return
 
-            except aiohttp.ClientError as re:
+            except requests.exceptions.RequestException as re:
                 last_err = f"request error: {re}"
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
@@ -766,13 +769,13 @@ async def download_attachment(attachment, media_dir, message_id, counter, total_
             # Backoff with a little jitter
             backoff = DOWNLOAD_BACKOFF_FACTOR * (2 ** (attempt - 1))
             jitter = backoff * (0.1 * (random.random() - 0.5))
-            await asyncio.sleep(max(0.1, backoff + jitter))
+            time.sleep(max(0.1, backoff + jitter))
 
-async def download_attachments_concurrently(messages, media_dir):
+def download_attachments_concurrently(messages, media_dir):
     """
     Download all attachments from messages concurrently with:
-      - a global tqdm showing "files left",
-      - each attachment's own tqdm for byte‐progress.
+      - a global tqdm showing “files left”,
+      - each attachment’s own tqdm for byte‐progress.
     (All other logic is unchanged—only how threads are submitted and tracked differs.)
     """
     ensure_dir(media_dir)
@@ -791,29 +794,37 @@ async def download_attachments_concurrently(messages, media_dir):
     counter = [0]
     lock = threading.Lock()
 
-    tasks = []
-    for attachment, message_id in attachments:
-        tasks.append(
-            download_attachment(
-                attachment,
-                media_dir,
-                message_id,
-                counter,
-                total_attachments,
-                lock
+    futures = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        for attachment, message_id in attachments:
+            futures.append(
+                executor.submit(
+                    download_attachment,
+                    attachment,
+                    media_dir,
+                    message_id,
+                    counter,
+                    total_attachments,
+                    lock
+                )
             )
-        )
 
-    await asyncio.gather(*tasks)
+        # # Wrap as_completed in tqdm to show how many remain:
+        # for _ in tqdm(
+            # as_completed(futures),
+            # total=total_attachments,
+            # desc="Attachments",
+            # unit="file"
+        # ):
+            # pass  # each future already tqdm.writes its own messages
 
-@rate_limiter(max_calls=4, per_seconds=1)
-async def download_embed(embed_url, file_path, current_time, message_timestamp, counter, total_embeds, lock):
+@rate_limiter(max_calls=2, per_seconds=1)
+def download_embed(embed_url, file_path, message_timestamp, counter, total_embeds, lock):
     """
     Robust embed downloader using same protections as attachments.
     """
     ensure_dir(os.path.dirname(file_path) or ".")
     _check_url = _normalize_url(embed_url)
-
     with _LINK_INDEX_LOCK:
         if _check_url in _LINK_INDEX_SET:
             with lock:
@@ -824,59 +835,58 @@ async def download_embed(embed_url, file_path, current_time, message_timestamp, 
 
     temp_path = file_path + ".part"
 
-    await wait_for_wifi_connection()
-    #await check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
-    #await pause_during_time_range("07:00", "11:00")
+    wait_for_wifi_connection()
+    check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
+    #pause_during_time_range("07:00", "11:00")
 
-    async with DOWNLOAD_SEMAPHORE:
+    with DOWNLOAD_SEMAPHORE:
+        session = _DOWNLOAD_SESSION
         attempt = 0
         last_err = None
         while attempt < DOWNLOAD_MAX_RETRIES:
             attempt += 1
             try:
-                async with aiohttp.ClientSession() as session:
-                    timeout = aiohttp.ClientTimeout(connect=DOWNLOAD_CONNECT_TIMEOUT, sock_read=DOWNLOAD_READ_TIMEOUT)
-                    async with session.get(embed_url, timeout=timeout) as r:
-                        r.raise_for_status()
-                        total_size = int(r.headers.get("Content-Length", 0) or 0)
-                        bytes_written = 0
-                        last_progress = time.time()
+                with session.get(embed_url, stream=True, timeout=(DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get("Content-Length", 0) or 0)
+                    bytes_written = 0
+                    last_progress = time.time()
 
-                        # Remove previous partial if present
-                        if os.path.exists(temp_path):
-                            try:
-                                os.remove(temp_path)
-                            except Exception:
-                                pass
+                    # Remove previous partial if present
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
 
-                        with open(temp_path, "wb") as fh, tqdm(
-                            total=total_size if total_size > 0 else None,
-                            unit="B",
-                            unit_scale=True,
-                            unit_divisor=1024,
-                            desc=os.path.basename(file_path)[:20],
-                            leave=False
-                        ) as pbar:
-                            async for chunk in r.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
-                                if chunk:
-                                    fh.write(chunk)
-                                    bytes_written += len(chunk)
-                                    last_progress = time.time()
-                                    pbar.update(len(chunk))
+                    with open(temp_path, "wb") as fh, tqdm(
+                        total=total_size if total_size > 0 else None,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=os.path.basename(file_path)[:20],
+                        leave=False
+                    ) as pbar:
+                        for chunk in r.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                            if chunk:
+                                fh.write(chunk)
+                                bytes_written += len(chunk)
+                                last_progress = time.time()
+                                pbar.update(len(chunk))
 
-                                if time.time() - last_progress > DOWNLOAD_STALL_TIMEOUT:
-                                    raise IOError(f"Stalled for >{DOWNLOAD_STALL_TIMEOUT}s")
+                            if time.time() - last_progress > DOWNLOAD_STALL_TIMEOUT:
+                                raise IOError(f"Stalled for >{DOWNLOAD_STALL_TIMEOUT}s")
 
-                        os.replace(temp_path, file_path)
+                    os.replace(temp_path, file_path)
 
-                        with lock:
-                            counter[0] += 1
-                            remaining = total_embeds - counter[0]
-                            tqdm.write(f" Remaining: {remaining} | [Current Time: {current_time}] | Successfully downloaded embed: {file_path}")
-                            _record_link(_check_url)
-                        return
+                    with lock:
+                        counter[0] += 1
+                        remaining = total_embeds - counter[0]
+                        tqdm.write(f" Remaining: {remaining} | [Current Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] | Successfully downloaded embed: {file_path}")
+                        _record_link(_check_url)
+                    return
 
-            except aiohttp.ClientError as re:
+            except requests.exceptions.RequestException as re:
                 last_err = f"request error: {re}"
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
@@ -892,18 +902,18 @@ async def download_embed(embed_url, file_path, current_time, message_timestamp, 
                 with lock:
                     counter[0] += 1
                     remaining = total_embeds - counter[0]
-                    tqdm.write(f" Remaining: {remaining} | [{current_time}] | Failed to download embed {embed_url}: {last_err}")
+                    tqdm.write(f" Remaining: {remaining} | [Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] | Failed to download embed {embed_url}: {last_err}")
                 return
 
             backoff = DOWNLOAD_BACKOFF_FACTOR * (2 ** (attempt - 1))
             jitter = backoff * (0.1 * (random.random() - 0.5))
-            await asyncio.sleep(max(0.1, backoff + jitter))
+            time.sleep(max(0.1, backoff + jitter))
 
-async def download_embeds(messages, embed_dir):
+def download_embeds(messages, embed_dir):
     """
     Download all embeds from messages concurrently with:
-      - a global tqdm showing "files left",
-      - each embed's own tqdm for byte‐progress.
+      - a global tqdm showing “files left”,
+      - each embed’s own tqdm for byte‐progress.
     (All other logic is unchanged—only the submission/tracking differs.)
     """
     ensure_dir(embed_dir)
@@ -935,27 +945,34 @@ async def download_embeds(messages, embed_dir):
     counter = [0]
     lock = threading.Lock()
 
-    tasks = []
-    for embed_url, message_id, timestamp in embeds:
-        base_name = embed_url.split("/")[-1].split("?")[0]
-        # Use hash of URL for unique identifier (deterministic), fallback to random if no URL
-        embed_id = abs(hash(embed_url)) % 100000 if embed_url else random.randint(1, 100)
-        file_path = os.path.join(embed_dir, f"{message_id}_{embed_id}_{base_name}")
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    futures = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for embed_url, message_id, timestamp in embeds:
+            base_name = embed_url.split("/")[-1].split("?")[0]
+            # Use hash of URL for unique identifier (deterministic), fallback to random if no URL
+            embed_id = abs(hash(embed_url)) % 100000 if embed_url else random.randint(1, 100)
+            file_path = os.path.join(embed_dir, f"{message_id}_{embed_id}_{base_name}")
 
-        tasks.append(
-            download_embed(
-                embed_url,
-                file_path,
-                current_time,
-                timestamp,
-                counter,
-                total_embeds,
-                lock
+
+            futures.append(
+                executor.submit(
+                    download_embed,
+                    embed_url,
+                    file_path,
+                    timestamp,
+                    counter,
+                    total_embeds,
+                    lock
+                )
             )
-        )
 
-    await asyncio.gather(*tasks)
+        # for _ in tqdm(
+            # #as_completed(futures),
+            # total=total_embeds,
+            # desc="Embeds",
+            # unit="file"
+        # ):
+            # pass  # per‐embed tqdm.writes happen inside download_embed()
 
 # --- Attach skip predicates to avoid waiting in rate_limiter when the item is already recorded ---
 
@@ -965,17 +982,19 @@ def _skip_if_attachment_already_downloaded(attachment, media_dir, message_id, co
         if not url:
             return False
         check_url = _normalize_url(url)
-        return check_url in _LINK_INDEX_SET
+        with _LINK_INDEX_LOCK:
+            return check_url in _LINK_INDEX_SET
     except Exception:
         return False
 
 # For embeds: first arg is embed_url (string)
-def _skip_if_embed_already_downloaded(embed_url, file_path, current_time, message_timestamp, counter, total_embeds, lock):
+def _skip_if_embed_already_downloaded(embed_url, file_path, message_timestamp, counter, total_embeds, lock):
     try:
         if not isinstance(embed_url, str):
             return False
         check_url = _normalize_url(embed_url)
-        return check_url in _LINK_INDEX_SET
+        with _LINK_INDEX_LOCK:
+            return check_url in _LINK_INDEX_SET
     except Exception:
         return False
 
@@ -991,7 +1010,7 @@ try:
 except Exception:
     pass
 
-async def fetch_channel_metadata(token, channel_id):
+def fetch_channel_metadata(token, channel_id):
 	"""
 	Fetch metadata for a channel, including DMs.
 	Args:
@@ -1003,17 +1022,15 @@ async def fetch_channel_metadata(token, channel_id):
 	url = f"https://discord.com/api/v9/channels/{channel_id}"
 	headers = {"Authorization": token}
 	try:
-		async with API_LIMITER:
-			async with aiohttp.ClientSession() as session:
-				async with session.get(url, headers=headers) as response:
-					response.raise_for_status()
-					channel_metadata = await response.json()
-					return channel_metadata
-	except aiohttp.ClientError as e:
+		response = requests.get(url, headers=headers)
+		response.raise_for_status()
+		channel_metadata = response.json()
+		return channel_metadata
+	except requests.exceptions.RequestException as e:
 		tqdm.write(f"Failed to fetch metadata for channel {channel_id}: {e}")
 		return {}
 
-async def fetch_category_channels(token, guild_id, category_id):
+def fetch_category_channels(token, guild_id, category_id):
 	"""
 	Fetch all text channels in a specified category.
 	Args:
@@ -1026,7 +1043,7 @@ async def fetch_category_channels(token, guild_id, category_id):
 	headers = {"Authorization": token}
 	url = f"https://discord.com/api/v9/guilds/{guild_id}/channels"
 	try:
-		all_channels = await api_request(url, headers)
+		all_channels = api_request(url, headers)
 
 		# Filter channels that belong to the given category ID
 		child_channels = [
@@ -1066,7 +1083,7 @@ def fetch_thread_channels(token, channel_id):
 	return all_threads
 
 
-async def fetch_server_channels(token, server_id):
+def fetch_server_channels(token, server_id):
 	"""
 	Fetch all channels in a server (guild).
 	Args:
@@ -1078,7 +1095,7 @@ async def fetch_server_channels(token, server_id):
 	url = f"https://discord.com/api/v9/guilds/{server_id}/channels"
 	headers = {"Authorization": token}
 	try:
-		all_channels = await api_request(url, headers)
+		all_channels = api_request(url, headers)
 
 		# Filter out channels that return "403 Missing Access"
 		accessible_channels = []
@@ -1089,8 +1106,8 @@ async def fetch_server_channels(token, server_id):
 			except Exception as e:
 				tqdm.write(f"Skipping channel {channel.get('id', 'unknown')} due to access issues: {e}")
 		return accessible_channels
-	except aiohttp.ClientResponseError as e:
-		if e.status == 404:
+	except requests.exceptions.HTTPError as e:
+		if e.response.status_code == 404:
 			# Suppress 404 errors for invalid server IDs
 			#tqdm.write(f"ID {server_id} is not a valid server ID (404 Not Found). Treating it as a channel/category.")
 			return None
@@ -1102,7 +1119,7 @@ async def fetch_server_channels(token, server_id):
 		return None
 
 
-async def process_server_and_channel_names(token, server_id, channel_id, output_dir, existing_names):
+def process_server_and_channel_names(token, server_id, channel_id, output_dir, existing_names):
 	"""
 	Sanitize and resolve conflicts for server and channel names.
 	Args:
@@ -1114,13 +1131,13 @@ async def process_server_and_channel_names(token, server_id, channel_id, output_
 	Returns:
 	- A tuple of (sanitized_server_name, sanitized_channel_name).
 	"""
-	server_name = await fetch_server_name(token, server_id, output_dir)
+	server_name = fetch_server_name(token, server_id, output_dir)
 	sanitized_server_name = sanitize_name_with_conflicts(server_name, existing_names)
 
 	server_dir = os.path.join(output_dir, server_name)
 	ensure_dir(server_dir)
 
-	channel_name = await fetch_channel_name(token, channel_id, server_dir, output_dir)
+	channel_name = fetch_channel_name(token, channel_id, server_dir, output_dir)
 
 	# Sanitize and resolve conflicts
 	sanitized_channel_name = sanitize_name_with_conflicts(channel_name, existing_names)
@@ -1129,7 +1146,7 @@ async def process_server_and_channel_names(token, server_id, channel_id, output_
 
 #============================================================================================ Main (CLI inputs and running the rest of the script)
 
-async def main():
+def main():
 	parser = argparse.ArgumentParser(description="Fetch Discord messages and media, sanitize directories, or scan for duplicates.")
 	parser.add_argument("--token", help="Discord API token. Required for downloading messages and media.")
 	parser.add_argument("--channels", help="Channel, category, or server IDs (comma-separated or file path).")
@@ -1197,7 +1214,7 @@ async def main():
 			# continue
 
 		# If not a server ID, handle as channel/category ID
-		channel_metadata = await fetch_channel_metadata(args.token, entry)
+		channel_metadata = fetch_channel_metadata(args.token, entry)
 		if not channel_metadata:
 			tqdm.write(f"Failed to fetch metadata for channel {entry}. Skipping.")
 			continue
@@ -1231,7 +1248,7 @@ async def main():
 					tqdm.write(f"Skipping blacklisted thread: {thread_meta.get('name', tid)} ({tid})")
 					continue
 				# Pass forum_dir as base_output_dir to process_channel
-				await process_channel(args, thread_meta, base_output_dir=forum_dir)
+				process_channel(args, thread_meta, base_output_dir=forum_dir)
 			continue
 
 		if channel_metadata["type"] == 4:  # Category
@@ -1241,18 +1258,18 @@ async def main():
 				continue
 
 			tqdm.write(f"Processing category: {channel_metadata.get('name', f'Category-{entry}')}")
-			child_channels = await fetch_category_channels(args.token, guild_id, entry)
+			child_channels = fetch_category_channels(args.token, guild_id, entry)
 			for child_channel in child_channels:
 				if child_channel["id"] in blacklist:
 					tqdm.write(f"Skipping blacklisted channel: {child_channel.get('name', 'Unknown')} ({child_channel['id']})")
 					continue
-				await process_channel(args, child_channel)
+				process_channel(args, child_channel)
 			continue
 
 		# Handle individual channels (DMs, Group DMs, or regular text channels)
-		await process_channel(args, channel_metadata)
+		process_channel(args, channel_metadata)
 
-async def process_channel(args, channel_metadata, base_output_dir=None):
+def process_channel(args, channel_metadata, base_output_dir=None):
 	"""
 	Process a single channel for message and media downloads.
 	Args:
@@ -1271,11 +1288,9 @@ async def process_channel(args, channel_metadata, base_output_dir=None):
 			ensure_dir(channel_dir)
 
 			tqdm.write(f"Processing DM or Group DM channel '{folder_name}'")
-			messages = []
-			async for batch in fetch_messages(args.token, channel_metadata["id"], channel_dir, save_raw=args.save_raw):
-				messages.extend(batch)
-			await download_attachments_concurrently(messages, os.path.join(channel_dir, "media"))
-			await download_embeds(messages, os.path.join(channel_dir, "embeds"))
+			messages = fetch_messages(args.token, channel_metadata["id"], channel_dir, save_raw=args.save_raw)
+			download_attachments_concurrently(messages, os.path.join(channel_dir, "media"))
+			download_embeds(messages, os.path.join(channel_dir, "embeds"))
 			return
 
 		# Process regular text channels
@@ -1284,7 +1299,7 @@ async def process_channel(args, channel_metadata, base_output_dir=None):
 			tqdm.write(f"Channel {channel_metadata['id']} does not belong to a guild. Skipping.")
 			return
 
-		sanitized_server_name, sanitized_channel_name = await process_server_and_channel_names(args.token, server_id, channel_metadata["id"], args.output, set())
+		sanitized_server_name, sanitized_channel_name = process_server_and_channel_names(args.token, server_id, channel_metadata["id"], args.output, set())
 
 		# If no custom base_output_dir was given, use the default server folder
 		server_dir = base_output_dir if base_output_dir else os.path.join(args.output, sanitized_server_name)
@@ -1292,14 +1307,12 @@ async def process_channel(args, channel_metadata, base_output_dir=None):
 		ensure_dir(channel_dir)
 
 		tqdm.write(f"Processing channel '{sanitized_channel_name}' in server '{sanitized_server_name}'")
-		messages = []
-		async for batch in fetch_messages(args.token, channel_metadata["id"], channel_dir, save_raw=args.save_raw):
-			messages.extend(batch)
-		await download_attachments_concurrently(messages, os.path.join(channel_dir, "media"))
-		await download_embeds(messages, os.path.join(channel_dir, "embeds"))
+		messages = fetch_messages(args.token, channel_metadata["id"], channel_dir, save_raw=args.save_raw)
+		download_attachments_concurrently(messages, os.path.join(channel_dir, "media"))
+		download_embeds(messages, os.path.join(channel_dir, "embeds"))
 	except Exception as e:
 		tqdm.write(f"Error processing channel {channel_metadata.get('id', 'unknown')}: {e}")
 
 
 if __name__ == "__main__":
-	asyncio.run(main())
+	main()
