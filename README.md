@@ -17,6 +17,9 @@ Current limitations:
 - replies are not linked within message.txt yet, this is a limitation of how messages are parsed from the json data provided by the discord api, this functionality will be added in a future version.
 - attachments are not listed with messages in messages.txt, again this is a limitation of how messages are parsed from the json data provided, this functionality will be added in a future version.
 
+WARNINGS/BUGS:
+- There is currently a bug that randomly happens when downloading either attachments or embeds which completely freezes any new downloads from occuring, i currently do not know why or how this happens since it only occurs once in a while but i will be doing my best to fix it, if it occurs please write an issue discribing when it occured (during attachment or embed download), how many files were remaining (terminal output should say how many were remaining), how many messages were fetched to get the attachments/embeds (if you are unable to provide this due to terminal scroll limits i understand), aprroximately how long has it been downloading for (should be able to find the time of the first download and last download but terminal scroll limits can restrict this so an estimate should suffice as well, but please use ~ when providing an estimate) 
+
 CHANGELOG:
 this code has gone through alot of changes before this repo was created so this is officaly v1 of the script
 v2.1: modified some parts of the code to make them (hopefully) compatibile with windows and mac, not just linux, also removed some hardcoded file paths which ive been using for my own system, this has been replaced with customizable settings for checking stoarge limits. 
