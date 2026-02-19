@@ -19,5 +19,6 @@ Current limitations:
 
 CHANGELOG:
 this code has gone through alot of changes before this repo was created so this is officaly v1 of the script
+v2.1: modified some parts of the code to make them (hopefully) compatibile with windows and mac, not just linux, also removed some hardcoded file paths which ive been using for my own system, this has been replaced with customizable settings for checking stoarge limits. 
 v2.0: (ig this could also be v-1.0 since im going backwards) due to a major performance decrease when having 100k+ downloads remaining i have switched the code back to its original mainly threadding setup for async downloading. 
 v1.0: refactored entire script to utilize asyncio, aiohttp, and threadding for async functions like file downloading.
