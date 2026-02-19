@@ -1,4 +1,7 @@
+#!/usr/bin/env python3
 import os
+import shutil
+import platform
 import requests
 import argparse
 import json
@@ -36,6 +39,11 @@ DOWNLOAD_CHUNK_SIZE = 8192
 
 # Shared semaphore to limit concurrent streaming downloads (prevents resource exhaustion)
 DOWNLOAD_SEMAPHORE = threading.Semaphore(DOWNLOAD_MAX_CONCURRENT)
+
+# Storage check configuration (set by main() from CLI args)
+_STORAGE_PATH = None
+_STORAGE_THRESHOLD_GB = 5.0
+_STORAGE_WAIT_SECONDS = 600
 
 # Shared requests.Session with a simple adapter for connection pooling
 def _make_download_session():
@@ -325,30 +333,34 @@ def wait_for_wifi_connection(check_interval=600):
 # Example usage: Call this function anywhere to pause execution until Wi-Fi is connected
 # wait_for_wifi_connection()
 
-def check_storage(drive_path: str, threshold_gb: float):
+def check_storage(drive_path: str, threshold_gb: float, wait_seconds: int = 600):
     """
     Checks the available storage space on the specified drive.
-    If the free space is less than the given threshold (in GB), it waits 60 minutes and checks again.
+    If the free space is less than the given threshold (in GB), it waits and checks again.
+    Cross-platform: uses shutil.disk_usage() which works on Windows, macOS, and Linux.
 
-    :param drive_path: Path to the drive (e.g., '/' for Linux/macOS, 'C:\\' for Windows, or external drive path)
+    :param drive_path: Path to the drive (e.g., '/' for Linux/macOS, 'C:\\' for Windows, or any directory path)
     :param threshold_gb: The threshold in gigabytes
+    :param wait_seconds: Seconds to wait before rechecking when below threshold (default: 600)
     """
     while True:
-        # Get disk usage statistics
-        stats = os.statvfs(drive_path)
-        free_space_gb = (stats.f_bavail * stats.f_frsize) / (1024 ** 3)  # Convert bytes to GB
+        # Get disk usage statistics (cross-platform)
+        usage = shutil.disk_usage(drive_path)
+        free_space_gb = usage.free / (1024 ** 3)  # Convert bytes to GB
 
         #tqdm.write(f"Free space on {drive_path}: {free_space_gb:.2f} GB")
 
         if free_space_gb < threshold_gb:
-            tqdm.write(f"Warning: Free space below {threshold_gb} GB! Checking again in 10 minutes...")
-            time.sleep(600)  # Wait 10 minutes
+            wait_min = wait_seconds / 60
+            tqdm.write(f"Warning: Free space ({free_space_gb:.2f} GB) below {threshold_gb} GB on '{drive_path}'! Checking again in {wait_min:.0f} minutes...")
+            time.sleep(wait_seconds)
         else:
             #tqdm.write("Sufficient storage available. Exiting check.")
             break
 
 # Example usage:
-# check_storage('/mnt/external_drive', 10)  # Adjust path and threshold as needed
+# check_storage('/mnt/external_drive', 10)  # Linux/macOS
+# check_storage('C:\\', 10)  # Windows
 
 def pause_during_time_range(start_time_str: str, end_time_str: str, check_interval: int = 3600):
     """
@@ -687,7 +699,7 @@ def download_attachment(attachment, media_dir, message_id, counter, total_attach
         return
 
     wait_for_wifi_connection()
-    check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
+    check_storage(_STORAGE_PATH, _STORAGE_THRESHOLD_GB, _STORAGE_WAIT_SECONDS)
     #pause_during_time_range("07:00", "11:00")
 
     # Acquire semaphore (limits how many streaming downloads run concurrently)
@@ -795,7 +807,7 @@ def download_attachments_concurrently(messages, media_dir):
     lock = threading.Lock()
 
     futures = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         for attachment, message_id in attachments:
             futures.append(
                 executor.submit(
@@ -836,7 +848,7 @@ def download_embed(embed_url, file_path, message_timestamp, counter, total_embed
     temp_path = file_path + ".part"
 
     wait_for_wifi_connection()
-    check_storage('/run/media/simon/556a3b22-87d2-477b-a842-1e3ecb0bb0d2', 5)
+    check_storage(_STORAGE_PATH, _STORAGE_THRESHOLD_GB, _STORAGE_WAIT_SECONDS)
     #pause_during_time_range("07:00", "11:00")
 
     with DOWNLOAD_SEMAPHORE:
@@ -1149,11 +1161,14 @@ def process_server_and_channel_names(token, server_id, channel_id, output_dir, e
 def main():
 	parser = argparse.ArgumentParser(description="Fetch Discord messages and media, sanitize directories, or scan for duplicates.")
 	parser.add_argument("--token", help="Discord API token. Required for downloading messages and media.")
-	parser.add_argument("--channels", help="Channel, category, or server IDs (comma-separated or file path).")
+	parser.add_argument("--channels", "--channel", dest="channels", help="Channel, category, or server IDs (comma-separated or file path).")
 	parser.add_argument("--blacklist", help="Channel or category IDs to skip (comma-separated or file path).")
 	parser.add_argument("--output", default="output", help="Output directory for saved files.")
 	parser.add_argument("--save-raw", action="store_true", help="Save raw message data to JSON.")
 	parser.add_argument("--category", action="store_true", help="Treat provided IDs as category IDs.")
+	parser.add_argument("--storage-path", default=None, help="Path to check for free disk space (default: auto-detect from output directory).")
+	parser.add_argument("--storage-threshold", type=float, default=5.0, help="Minimum free disk space in GB before pausing downloads (default: 5).")
+	parser.add_argument("--storage-wait", type=int, default=600, help="Seconds to wait when disk space is below threshold (default: 600).")
 
 	args = parser.parse_args()
 
@@ -1183,6 +1198,20 @@ def main():
 		return
 
 	ensure_dir(args.output)
+
+	# Configure storage checks from CLI args
+	global _STORAGE_PATH, _STORAGE_THRESHOLD_GB, _STORAGE_WAIT_SECONDS
+	_STORAGE_THRESHOLD_GB = args.storage_threshold
+	_STORAGE_WAIT_SECONDS = args.storage_wait
+	if args.storage_path:
+		_STORAGE_PATH = args.storage_path
+	else:
+		_STORAGE_PATH = os.path.realpath(args.output)
+
+	# Platform detection logging
+	tqdm.write(f"Platform: {platform.system()} {platform.release()} ({platform.machine()})")
+	tqdm.write(f"Python: {platform.python_version()}")
+	tqdm.write(f"Storage check path: {_STORAGE_PATH} (threshold: {_STORAGE_THRESHOLD_GB} GB, wait: {_STORAGE_WAIT_SECONDS}s)")
 
 	# Track sanitized server names to avoid creating multiple folders
 	server_name_cache = {}
